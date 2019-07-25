@@ -10,7 +10,9 @@ from __future__ import division
 from __future__ import print_function
 
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '2'
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+from tensorflow.python.client import device_lib
+print(device_lib.list_local_devices())
 import collections
 import modeling
 import optimization
@@ -19,6 +21,10 @@ import tensorflow as tf
 from tensorflow.python.ops import math_ops
 import tf_metrics
 import pickle
+from tensorflow.contrib import crf
+from tensorflow.contrib.layers.python.layers import initializers
+
+
 flags = tf.flags
 
 FLAGS = flags.FLAGS
@@ -359,7 +365,7 @@ def file_based_input_fn_builder(input_file, seq_length, is_training, drop_remain
 
 
 def create_model(bert_config, is_training, input_ids, input_mask,
-                 segment_ids, labels, num_labels, use_one_hot_embeddings):
+                 segment_ids, label_ids, num_labels, use_one_hot_embeddings):
     model = modeling.BertModel(
         config=bert_config,
         is_training=is_training,
@@ -370,6 +376,10 @@ def create_model(bert_config, is_training, input_ids, input_mask,
     )
 
     output_layer = model.get_sequence_output()
+
+    # 算序列真实长度
+    used = tf.sign(tf.abs(input_ids))
+    lengths = tf.reduce_sum(used, reduction_indices=1)  # [batch_size] 大小的向量，包含了当前batch中的序列长度
 
     hidden_size = output_layer.shape[-1].value
 
@@ -391,14 +401,33 @@ def create_model(bert_config, is_training, input_ids, input_mask,
         # loss = tf.contrib.seq2seq.sequence_loss(logits,labels,mask)
         # return (loss, logits, predict)
         ##########################################################################
-        log_probs = tf.nn.log_softmax(logits, axis=-1)
-        one_hot_labels = tf.one_hot(labels, depth=num_labels, dtype=tf.float32)
-        per_example_loss = -tf.reduce_sum(one_hot_labels * log_probs, axis=-1)
-        loss = tf.reduce_sum(per_example_loss)
-        probabilities = tf.nn.softmax(logits, axis=-1)
-        predict = tf.argmax(probabilities,axis=-1)
-        return (loss, per_example_loss, logits, log_probs, predict)
+        # log_probs = tf.nn.log_softmax(logits, axis=-1)
+        # one_hot_labels = tf.one_hot(labels, depth=num_labels, dtype=tf.float32)
+        # per_example_loss = -tf.reduce_sum(one_hot_labels * log_probs, axis=-1)
+        # loss = tf.reduce_sum(per_example_loss)
+        # probabilities = tf.nn.softmax(logits, axis=-1)
+        # predict = tf.argmax(probabilities,axis=-1)
+        # return (loss, per_example_loss, logits, log_probs, predict)
         ##########################################################################
+        log_probs = tf.nn.log_softmax(logits, axis=-1)
+        trans = tf.get_variable(
+            "transitions",
+            shape=[num_labels, num_labels],
+            initializer=initializers.xavier_initializer())
+
+        log_likelihood, trans = tf.contrib.crf.crf_log_likelihood(
+            inputs=logits,
+            tag_indices=label_ids,
+            transition_params=trans,
+            sequence_lengths=lengths)
+        crf_loss = tf.reduce_mean(-log_likelihood)
+        # CRF decode, pred_ids 是一条最大概率的标注路径
+        pred_ids, _ = crf.crf_decode(potentials=logits, transition_params=trans, sequence_length=lengths)
+        return (crf_loss, logits, log_probs, pred_ids)
+
+        ##########################################################################
+
+
         
 def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
                      num_train_steps, num_warmup_steps, use_tpu,
@@ -414,7 +443,7 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
         #label_mask = features["label_mask"]
         is_training = (mode == tf.estimator.ModeKeys.TRAIN)
 
-        (total_loss,  per_example_loss, logits, log_probs, predicts) = create_model(
+        (total_loss, logits, log_probs, pred_ids) = create_model(
             bert_config, is_training, input_ids, input_mask,segment_ids, label_ids,
             num_labels, use_one_hot_embeddings)
         tvars = tf.trainable_variables()
@@ -446,7 +475,7 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
                 train_op=train_op,
                 scaffold_fn=scaffold_fn)
         elif mode == tf.estimator.ModeKeys.EVAL:      
-            def metric_fn(per_example_loss, label_ids, logits):
+            def metric_fn(label_ids, logits, pred_ids):
             # def metric_fn(label_ids, logits):
                 pos_inds = list(range(1, num_labels-4))
             #     pos_inds = [1,2]
@@ -454,14 +483,19 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
                 precision = tf_metrics.precision(label_ids,predictions,num_labels,pos_inds,average="macro")
                 recall = tf_metrics.recall(label_ids,predictions,num_labels,pos_inds,average="macro")
                 f = tf_metrics.f1(label_ids,predictions,num_labels, pos_inds,average="macro")
+
+                accuracy = tf.metrics.accuracy(labels=label_ids, predictions=pred_ids)
+                loss = tf.metrics.mean_squared_error(labels=label_ids, predictions=pred_ids)
+
                 #
                 return {
-                    "eval_precision":precision,
-                    "eval_recall":recall,
+                    "eval_precision": precision,
+                    "eval_recall": recall,
                     "eval_f": f,
-                    #"eval_loss": loss,
+                    "eval_accuracy": accuracy,
+                    "eval_loss": loss,
                 }
-            eval_metrics = (metric_fn, [per_example_loss, label_ids, logits])
+            eval_metrics = (metric_fn, [label_ids, logits, pred_ids])
             # eval_metrics = (metric_fn, [label_ids, logits])
             output_spec = tf.contrib.tpu.TPUEstimatorSpec(
                 mode=mode,
@@ -472,7 +506,7 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
         elif mode == tf.estimator.ModeKeys.PREDICT:
             output_spec = tf.contrib.tpu.TPUEstimatorSpec(
                 mode=mode,
-                predictions={"prediction": predicts, "log_probs": log_probs},
+                predictions={"prediction": pred_ids, "log_probs": log_probs},
                 scaffold_fn=scaffold_fn
             )
         return output_spec
@@ -658,17 +692,17 @@ if __name__ == "__main__":
     FLAGS.data_dir = "data"
     FLAGS.bert_config_file = "MODEL/biobert/bert_config.json"
     FLAGS.vocab_file = "MODEL/biobert/vocab.txt"
-    FLAGS.output_dir = "OUTPUT/weng_chia"
-    # FLAGS.init_checkpoint = "MODEL/biobert/model.ckpt-1000000"   #biobert pre-trained
-    FLAGS.init_checkpoint = "MODEL/cased/bert_model.ckpt"   #bert base
+    FLAGS.output_dir = "OUTPUT/weng_chia_ner"
+    # FLAGS.init_checkpoint = "MODEL/biobert/model.ckpt-1000000"
+    FLAGS.init_checkpoint = "MODEL/cased/bert_model.ckpt"  # bert base
     # FLAGS.init_checkpoint = "tmp/testNER"
     FLAGS.train_batch_size = 16
     FLAGS.max_seq_length = 128
     FLAGS.num_train_epochs = 20
     FLAGS.do_lower_case = False
 
-    FLAGS.do_train = False  # True
-    FLAGS.do_eval = False  # True
+    FLAGS.do_train = True  # True
+    FLAGS.do_eval = True  # True
     FLAGS.do_predict = True  # False
     FLAGS.task_name = "ner"
     FLAGS.use_tpu = False

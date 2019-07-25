@@ -26,7 +26,7 @@ def detokenize(golden_path, pred_token_test_path, pred_label_test_path, output_d
     ans['toks'] = list()
     ans['labels'] = list()
     lineNoCount=0
-    with open(golden_path,'r') as in_:
+    with open(golden_path,'r', encoding='utf-8') as in_:
         for line in in_:
             line = line.strip()
             if line == '':
@@ -40,12 +40,12 @@ def detokenize(golden_path, pred_token_test_path, pred_label_test_path, output_d
     
     # read predicted
     pred = dict({'toks':[], 'labels':[]}) # dictionary for predicted tokens and labels.
-    with open(pred_token_test_path,'r') as in_: #'token_test.txt'
+    with open(pred_token_test_path,'r', encoding='utf-8') as in_: #'token_test.txt'
         for line in in_:
             line = line.strip()
             pred['toks'].append(line)
             
-    with open(pred_label_test_path,'r') as in_: #'label_test_3_epoch.txt'
+    with open(pred_label_test_path,'r', encoding='utf-8') as in_: #'label_test.txt'
         for line in in_:
             line = line.strip()
             if line in ['[CLS]','[SEP]', 'X']: # replace non-text tokens with O. This will not be evaluated.
@@ -76,13 +76,13 @@ def detokenize(golden_path, pred_token_test_path, pred_label_test_path, output_d
         print("Error! : len(ans['labels']) != len(bert_pred['labels']) : Please report us")
         raise
     
-    with open(output_dir+'/NER_result_conll.txt', 'w') as out_:
+    with open(output_dir+'/NER_result_conll.txt', 'w', encoding='utf-8') as out_:
         idx=0
         for ans_t in ans['toks']:
             if ans_t=='[SEP]':
                 out_.write("\n")
             else :
-                out_.write("%s %s-MISC %s-MISC\n"%(bert_pred['toks'][idx], ans['labels'][idx], bert_pred['labels'][idx]))
+                out_.write("%s %s %s\n"%(bert_pred['toks'][idx], ans['labels'][idx], bert_pred['labels'][idx]))
                 idx+=1
 
 detokenize(args.answer_path, args.token_test_path, args.label_test_path, args.output_dir)
